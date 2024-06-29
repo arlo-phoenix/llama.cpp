@@ -2093,6 +2093,7 @@ struct llama_hparams {
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_vocab_type = 0; // for BERT-style token types
+    uint32_t n_sliding_window = 4096;
 
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q = 0;
@@ -2128,6 +2129,7 @@ struct llama_hparams {
     bool causal_attn   = true;
     bool use_alibi     = false;
     bool attn_soft_cap = false;
+    bool sliding_wd = false;
 
     enum llama_pooling_type      pooling_type            = LLAMA_POOLING_TYPE_NONE;
     enum llama_rope_type         rope_type               = LLAMA_ROPE_TYPE_NONE;
@@ -4717,6 +4719,7 @@ static void llm_load_hparams(
                 ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping, false);
                 ml.get_key(LLM_KV_QUERY_PRE_ATTN_SCALAR, hparams.f_query_pre_attn_scalar, false);
                 hparams.attn_soft_cap = true;
+                hparams.sliding_wd = true;
 
                 switch (hparams.n_layer) {
                     case 42: model.type = e_model::MODEL_9B; break;
@@ -12686,7 +12689,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
                     for (int i = 0; i < n_kv; ++i) {
                         float f;
-                        if (!lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos) {
+                        if (!lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos
+                            || (hparams.sliding_wd && pos-lctx.kv_self.cells[i].pos > hparams.n_sliding_window)) {
                             f = -INFINITY;
                         } else {
                             if (hparams.use_alibi) {
