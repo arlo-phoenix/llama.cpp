@@ -2654,17 +2654,18 @@ struct llama_context {
     void *              abort_callback_data = nullptr;
 
     // input tensors
-    struct ggml_tensor * inp_tokens;    // I32 [n_batch]
-    struct ggml_tensor * inp_embd;      // F32 [n_embd, n_batch]
-    struct ggml_tensor * inp_pos;       // I32 [n_batch]
-    struct ggml_tensor * inp_out_ids;   // I32 [n_outputs]
-    struct ggml_tensor * inp_KQ_mask;   // F32 [kv_size, n_batch]
-    struct ggml_tensor * inp_K_shift;   // I32 [kv_size]
-    struct ggml_tensor * inp_mean;      // F32 [n_batch, n_batch]
-    struct ggml_tensor * inp_cls;       // I32 [n_batch]
-    struct ggml_tensor * inp_s_copy;    // I32 [kv_size]
-    struct ggml_tensor * inp_s_mask;    // F32 [1, n_kv]
-    struct ggml_tensor * inp_s_seq;     // I32 [n_kv, n_batch]
+    struct ggml_tensor * inp_tokens;      // I32 [n_batch]
+    struct ggml_tensor * inp_embd;        // F32 [n_embd, n_batch]
+    struct ggml_tensor * inp_pos;         // I32 [n_batch]
+    struct ggml_tensor * inp_out_ids;     // I32 [n_outputs]
+    struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
+    struct ggml_tensor * inp_KQ_sld_mask; // F32 [kv_size, n_batch]
+    struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
+    struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
+    struct ggml_tensor * inp_cls;         // I32 [n_batch]
+    struct ggml_tensor * inp_s_copy;      // I32 [kv_size]
+    struct ggml_tensor * inp_s_mask;      // F32 [1, n_kv]
+    struct ggml_tensor * inp_s_seq;       // I32 [n_kv, n_batch]
 
     // control vectors
     struct llama_control_vector cvec;
@@ -7782,17 +7783,18 @@ struct llm_build_context {
 
         ctx0 = ggml_init(params);
 
-        lctx.inp_tokens  = nullptr;
-        lctx.inp_embd    = nullptr;
-        lctx.inp_pos     = nullptr;
-        lctx.inp_out_ids = nullptr;
-        lctx.inp_KQ_mask = nullptr;
-        lctx.inp_K_shift = nullptr;
-        lctx.inp_mean    = nullptr;
-        lctx.inp_cls     = nullptr;
-        lctx.inp_s_copy  = nullptr;
-        lctx.inp_s_mask  = nullptr;
-        lctx.inp_s_seq   = nullptr;
+        lctx.inp_tokens      = nullptr;
+        lctx.inp_embd        = nullptr;
+        lctx.inp_pos         = nullptr;
+        lctx.inp_out_ids     = nullptr;
+        lctx.inp_KQ_mask     = nullptr;
+        lctx.inp_KQ_sld_mask = nullptr;
+        lctx.inp_K_shift     = nullptr;
+        lctx.inp_mean        = nullptr;
+        lctx.inp_cls         = nullptr;
+        lctx.inp_s_copy      = nullptr;
+        lctx.inp_s_mask      = nullptr;
+        lctx.inp_s_seq       = nullptr;
     }
 
     void free() {
@@ -7955,6 +7957,18 @@ struct llm_build_context {
         ggml_set_input(lctx.inp_KQ_mask);
         return flash_attn ? ggml_cast(ctx0, lctx.inp_KQ_mask, GGML_TYPE_F16) : lctx.inp_KQ_mask;
     }
+
+    struct ggml_tensor * build_inp_KQ_sld_mask(bool causal = true) {
+        if (causal) {
+            lctx.inp_KQ_sld_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        } else {
+            lctx.inp_KQ_sld_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        }
+        cb(lctx.inp_KQ_sld_mask, "KQ_sld_mask", -1);
+        ggml_set_input(lctx.inp_KQ_sld_mask);
+        return flash_attn ? ggml_cast(ctx0, lctx.inp_KQ_sld_mask, GGML_TYPE_F16) : lctx.inp_KQ_sld_mask;
+    }
+
 
     struct ggml_tensor * build_inp_mean() {
         lctx.inp_mean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
@@ -11037,6 +11051,8 @@ struct llm_build_context {
 
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+        // separate sliding mask, only every other layer (layer_idx % 2) is sliding, others are global with ctx 8192
+        struct ggml_tensor * KQ_sld_mask = build_inp_KQ_sld_mask();
 
         for (int il = 0; il < n_layer; ++il) {
             // norm
@@ -11072,9 +11088,11 @@ struct llm_build_context {
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Kcur, "Kcur", il);
 
+                struct ggml_tensor * used_kq_mask = il % 2 == 0 ? KQ_sld_mask : KQ_mask;
+
                 cur = llm_build_kv(ctx0, model, hparams, cparams, kv_self, gf,
                         model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f, cb, il);
+                        Kcur, Vcur, Qcur, used_kq_mask, n_tokens, kv_head, n_kv, 1.0f, cb, il);
             }
 
             cur = llm_build_norm(ctx0, cur, hparams,
@@ -12689,8 +12707,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
                     for (int i = 0; i < n_kv; ++i) {
                         float f;
-                        if (!lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos
-                            || (hparams.sliding_wd && pos-lctx.kv_self.cells[i].pos > hparams.n_sliding_window)) {
+                        if (!lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos) {
                             f = -INFINITY;
                         } else {
                             if (hparams.use_alibi) {
@@ -12741,6 +12758,46 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     for (int i = n_tokens; i < n_stride; ++i) {
                         data[h*(n_tokens*n_tokens) + j*n_stride + i] = -INFINITY;
                     }
+                }
+            }
+        }
+    }
+
+    if(lctx.inp_KQ_sld_mask) {
+        const int64_t n_kv     = kv_self.n;
+        const int64_t n_tokens = batch.n_tokens;
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_sld_mask->buffer));
+
+        float * data = (float *) lctx.inp_KQ_sld_mask->data;
+
+        // For causal attention, use only the previous KV cells
+        // of the correct sequence for each token of the batch.
+        // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
+        for (int h = 0; h < 1; ++h) {
+            for (int j = 0; j < n_tokens; ++j) {
+                const llama_pos    pos    = batch.pos[j];
+                const llama_seq_id seq_id = batch.seq_id[j][0];
+
+                for (int i = 0; i < n_kv; ++i) {
+                    float f;
+                    if (!lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos
+                        || (hparams.sliding_wd && pos - lctx.kv_self.cells[i].pos > hparams.n_sliding_window)) {
+                        f = -INFINITY;
+                    } else {
+                        if (hparams.use_alibi) {
+                            f = -fabs(lctx.kv_self.cells[i].pos - pos);
+                        } else {
+                            f = 0.0f;
+                        }
+                    }
+                    data[h*(n_kv*n_tokens) + j*n_kv + i] = f;
+                }
+            }
+
+            for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
+                for (int j = 0; j < n_kv; ++j) {
+                    data[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
                 }
             }
         }
